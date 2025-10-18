@@ -85,7 +85,7 @@ func handleError(err error) {
 func outputJSON(info githubapi.RepositoryInfo) error {
 	data, err := json.MarshalIndent(info, "", "  ")
 	if err != nil {
-		return fmt.Errorf("JSONの整形に失敗しました: %w", err)
+		return fmt.Errorf("failed to format JSON: %w", err)
 	}
 
 	fmt.Println(string(data))
@@ -111,7 +111,7 @@ func outputTable(info githubapi.RepositoryInfo) error {
 	fmt.Fprintf(w, "Pushed:\t%s\n", info.PushedAt.Local().Format(time.RFC1123))
 
 	if err := w.Flush(); err != nil {
-		return fmt.Errorf("表形式出力の書き込みに失敗しました: %w", err)
+		return fmt.Errorf("failed to tabwrite output.: %w", err)
 	}
 	return nil
 }
