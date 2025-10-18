@@ -15,50 +15,41 @@ const (
 	defaultBaseURL     = "https://api.github.com"
 	defaultAPIVersion  = "2022-11-28"
 	acceptHeader       = "application/vnd.github+json"
-	errorBodyReadLimit = 4 << 10 // エラー本文は4KBまでに制限して読み取る
+	errorBodyReadLimit = 4 << 10 // エラー本文は 4KB まで読めれば十分とする
 	defaultTimeout     = 5 * time.Second
 )
 
-// Doer は http.Client と同じ Do メソッドを持つインターフェース。
-// テスト時に HTTP 呼び出しを差し替えられるように定義している。
-type Doer interface {
-	Do(*http.Request) (*http.Response, error)
-}
-
-// Client は GitHub API へアクセスするためのクライアントを表す。
-// HTTP クライアントや API バージョン、トークンなどを保持する。
+// Client は GitHub REST API への問い合わせを担当する。
 type Client struct {
+	httpClient *http.Client
 	baseURL    string
-	httpClient Doer
 	token      string
 	apiVersion string
 }
 
-// NewClient は標準の http.Client をベースにした Client を生成する。
-// timeout が0以下の場合はデフォルトのタイムアウトを適用する。
+// NewClient はデフォルト設定のクライアントを返す。
 func NewClient(timeout time.Duration, token string) *Client {
 	if timeout <= 0 {
 		timeout = defaultTimeout
 	}
 
 	return &Client{
-		baseURL:    defaultBaseURL,
 		httpClient: &http.Client{Timeout: timeout},
+		baseURL:    defaultBaseURL,
 		token:      strings.TrimSpace(token),
 		apiVersion: defaultAPIVersion,
 	}
 }
 
-// SetHTTPClient は外部から Doer を差し替えるためのセッター。
-// 主にテスト用に利用することを想定している。
-func (c *Client) SetHTTPClient(doer Doer) {
-	if doer == nil {
+// SetHTTPClient は外部で用意した http.Client を差し替えたい場合に利用する。
+func (c *Client) SetHTTPClient(client *http.Client) {
+	if client == nil {
 		return
 	}
-	c.httpClient = doer
+	c.httpClient = client
 }
 
-// RepositoryInfo は CLI 側で利用しやすい形に整形したリポジトリ情報。
+// RepositoryInfo は CLI へ渡すためのリポジトリ情報。
 type RepositoryInfo struct {
 	FullName    string
 	Description string
@@ -75,7 +66,110 @@ type RepositoryInfo struct {
 	PushedAt    time.Time
 }
 
-// apiRepository は GitHub API のレスポンス形式を受け取るための内部構造体。
+// RepositoryInfoError は GitHub API からのエラー応答を保持する。
+type RepositoryInfoError struct {
+	StatusCode int
+	Message    string
+}
+
+func (e *RepositoryInfoError) Error() string {
+	return fmt.Sprintf("github api error: status=%d message=%s", e.StatusCode, e.Message)
+}
+
+// GetRepositoryByFullName は "owner/repo" 形式の入力を受け取る。
+func (c *Client) GetRepositoryByFullName(ctx context.Context, fullName string) (RepositoryInfo, error) {
+	owner, repo, err := splitFullName(fullName)
+	if err != nil {
+		return RepositoryInfo{}, err
+	}
+	return c.GetRepository(ctx, owner, repo)
+}
+
+// GetRepository は owner と repo を明示的に受け取って問い合わせる。
+func (c *Client) GetRepository(ctx context.Context, owner, repo string) (RepositoryInfo, error) {
+	if c.httpClient == nil {
+		return RepositoryInfo{}, errors.New("http client is not configured")
+	}
+
+	req, err := c.buildRequest(ctx, owner, repo)
+	if err != nil {
+		return RepositoryInfo{}, err
+	}
+
+	res, err := c.httpClient.Do(req)
+	if err != nil {
+		return RepositoryInfo{}, fmt.Errorf("request failed: %w", err)
+	}
+	defer res.Body.Close()
+
+	if err := checkStatus(res); err != nil {
+		return RepositoryInfo{}, err
+	}
+
+	return parseRepository(res.Body)
+}
+
+func (c *Client) buildRequest(ctx context.Context, owner, repo string) (*http.Request, error) {
+	owner = strings.TrimSpace(owner)
+	repo = strings.TrimSpace(repo)
+	if owner == "" || repo == "" {
+		return nil, errors.New("owner and repo must be specified")
+	}
+
+	url := fmt.Sprintf("%s/repos/%s/%s", c.baseURL, owner, repo)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build request: %w", err)
+	}
+
+	req.Header.Set("Accept", acceptHeader)
+	req.Header.Set("X-GitHub-Api-Version", c.apiVersion)
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+
+	return req, nil
+}
+
+func checkStatus(res *http.Response) error {
+	if res.StatusCode >= http.StatusOK && res.StatusCode < http.StatusMultipleChoices {
+		return nil
+	}
+
+	body, err := io.ReadAll(io.LimitReader(res.Body, errorBodyReadLimit))
+	if err != nil {
+		return &RepositoryInfoError{StatusCode: res.StatusCode, Message: res.Status}
+	}
+
+	return &RepositoryInfoError{
+		StatusCode: res.StatusCode,
+		Message:    strings.TrimSpace(string(body)),
+	}
+}
+
+func parseRepository(r io.Reader) (RepositoryInfo, error) {
+	var raw apiRepository
+	if err := json.NewDecoder(r).Decode(&raw); err != nil {
+		return RepositoryInfo{}, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	return RepositoryInfo{
+		FullName:    raw.FullName,
+		Description: raw.Description,
+		HTMLURL:     raw.HTMLURL,
+		Language:    raw.Language,
+		License:     extractLicenseName(raw.License),
+		Stars:       raw.StargazersCount,
+		Forks:       raw.ForksCount,
+		Watchers:    raw.WatchersCount,
+		OpenIssues:  raw.OpenIssuesCount,
+		Archived:    raw.Archived,
+		Disabled:    raw.Disabled,
+		UpdatedAt:   raw.UpdatedAt,
+		PushedAt:    raw.PushedAt,
+	}, nil
+}
+
 type apiRepository struct {
 	FullName        string      `json:"full_name"`
 	Description     string      `json:"description"`
@@ -97,83 +191,6 @@ type apiLicense struct {
 	SpdxID string `json:"spdx_id"`
 }
 
-// RepositoryInfoError は API からのエラーレスポンスを表すカスタムエラー。
-type RepositoryInfoError struct {
-	StatusCode int
-	Message    string
-}
-
-func (e *RepositoryInfoError) Error() string {
-	return fmt.Sprintf("github api error: status=%d message=%s", e.StatusCode, e.Message)
-}
-
-// GetRepository は owner/repo 形式の文字列を受け取り、リポジトリ情報を取得する。
-func (c *Client) GetRepository(ctx context.Context, ownerRepo string) (RepositoryInfo, error) {
-	var info RepositoryInfo
-
-	if c.httpClient == nil {
-		return info, errors.New("http client is not configured")
-	}
-
-	ownerRepo = strings.TrimSpace(ownerRepo)
-	if ownerRepo == "" {
-		return info, errors.New("repository identifier is empty")
-	}
-
-	if !strings.Contains(ownerRepo, "/") {
-		return info, fmt.Errorf("repository identifier must be in the form owner/repo: %s", ownerRepo)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/repos/"+ownerRepo, nil)
-	if err != nil {
-		return info, fmt.Errorf("failed to build request: %w", err)
-	}
-
-	// GitHub API が推奨するヘッダ群をセットする。
-	req.Header.Set("Accept", acceptHeader)
-	req.Header.Set("X-GitHub-Api-Version", c.apiVersion)
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
-	}
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return info, fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		body, readErr := io.ReadAll(io.LimitReader(resp.Body, errorBodyReadLimit))
-		if readErr != nil {
-			return info, &RepositoryInfoError{StatusCode: resp.StatusCode, Message: resp.Status}
-		}
-		return info, &RepositoryInfoError{StatusCode: resp.StatusCode, Message: strings.TrimSpace(string(body))}
-	}
-
-	var apiResp apiRepository
-	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
-		return info, fmt.Errorf("failed to decode response: %w", err)
-	}
-
-	info = RepositoryInfo{
-		FullName:    apiResp.FullName,
-		Description: apiResp.Description,
-		HTMLURL:     apiResp.HTMLURL,
-		Language:    apiResp.Language,
-		License:     extractLicenseName(apiResp.License),
-		Stars:       apiResp.StargazersCount,
-		Forks:       apiResp.ForksCount,
-		Watchers:    apiResp.WatchersCount,
-		OpenIssues:  apiResp.OpenIssuesCount,
-		Archived:    apiResp.Archived,
-		Disabled:    apiResp.Disabled,
-		UpdatedAt:   apiResp.UpdatedAt,
-		PushedAt:    apiResp.PushedAt,
-	}
-
-	return info, nil
-}
-
 func extractLicenseName(license *apiLicense) string {
 	if license == nil {
 		return ""
@@ -182,4 +199,13 @@ func extractLicenseName(license *apiLicense) string {
 		return license.Name
 	}
 	return license.SpdxID
+}
+
+func splitFullName(fullName string) (string, string, error) {
+	fullName = strings.TrimSpace(fullName)
+	parts := strings.Split(fullName, "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", fmt.Errorf("repository must be in the form owner/repo: %s", fullName)
+	}
+	return parts[0], parts[1], nil
 }
